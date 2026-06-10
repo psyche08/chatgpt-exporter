@@ -533,6 +533,24 @@ const DialogContent: FC<DialogContentProps> = ({ format }) => {
         return () => off()
     }, [deleteQueue, selected, t])
 
+    // When automatic retries run out, ask the user whether to keep going.
+    // confirm() blocks the queue right at the failure point, which is exactly
+    // the pause we want while the user decides.
+    useEffect(() => {
+        const itemExhausted = (name: string, error: unknown) => {
+            const msg = error instanceof Error ? error.message : String(error)
+            return confirm(`"${name}" keeps failing (${msg}).\n\nOK: keep retrying this item\nCancel: skip it and continue`)
+        }
+        const pausesExhausted = (error: unknown) => {
+            const msg = error instanceof Error ? error.message : String(error)
+            return confirm(`The API keeps blocking requests (${msg}) even after several long pauses.\n\nOK: keep waiting and retrying\nCancel: stop here (already exported parts are kept)`)
+        }
+        for (const queue of [requestQueue, archiveQueue, deleteQueue]) {
+            queue.onItemExhausted = itemExhausted
+            queue.onPausesExhausted = pausesExhausted
+        }
+    }, [requestQueue, archiveQueue, deleteQueue])
+
     const cancelExport = useCallback(() => {
         cancelledRef.current = true
         requestQueue.stop()
@@ -646,6 +664,7 @@ const DialogContent: FC<DialogContentProps> = ({ format }) => {
             },
             (hasMore) => { if (alive()) setHasMore(hasMore) },
             (waitMs) => { if (alive()) setLoadWaitSecs(Math.ceil(waitMs / 1000)) },
+            error => alive() && confirm(`Loading the conversation list keeps failing (${error.message}).\n\nOK: keep retrying\nCancel: stop loading (conversations loaded so far are kept)`),
         )
             .then((result) => {
                 if (!alive()) return
@@ -674,6 +693,7 @@ const DialogContent: FC<DialogContentProps> = ({ format }) => {
                 selectedProjectId ? (pos.cursor ?? 0) : pos.offset,
                 limit,
                 waitMs => setLoadWaitSecs(Math.ceil(waitMs / 1000)),
+                error => confirm(`Loading more conversations keeps failing (${error.message}).\n\nOK: keep retrying\nCancel: stop loading`),
             )
             // Advance by the raw page, not the deduped result, so the next
             // request continues from where the API actually left off

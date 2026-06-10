@@ -73,6 +73,19 @@ export class RequestQueue<T> {
     /** How many global rate-limit pauses have been applied so far */
     private globalPauses = 0
 
+    /**
+     * Consulted when a single item has exhausted its automatic retries.
+     * Return true to grant the item a fresh round of retries (e.g. after
+     * asking the user), false to skip it. When absent the item is skipped.
+     */
+    onItemExhausted?: (name: string, error: unknown) => boolean | Promise<boolean>
+    /**
+     * Consulted when the whole queue has been paused MAX_GLOBAL_PAUSES times
+     * without recovering. Return true to keep waiting and retrying (the pause
+     * escalation restarts), false to stop the queue. When absent it stops.
+     */
+    onPausesExhausted?: (error: unknown) => boolean | Promise<boolean>
+
     constructor(private minBackoff: number, private maxBackoff: number) {
         this.backoff = minBackoff
     }
@@ -156,10 +169,16 @@ export class RequestQueue<T> {
             if (error instanceof RateLimitError) {
                 this.globalPauses++
                 if (this.globalPauses > MAX_GLOBAL_PAUSES) {
-                    // Rate limit persists even after several long pauses — abort.
-                    console.warn('[Exporter] Queue stopped: API rate limit did not clear after', MAX_GLOBAL_PAUSES, 'pauses')
-                    this.stop()
-                    return
+                    // Rate limit persists even after several long pauses —
+                    // let the caller (user) decide whether to keep waiting.
+                    if (this.onPausesExhausted && await this.onPausesExhausted(error)) {
+                        this.globalPauses = 1 // keep going — restart the pause escalation
+                    }
+                    else {
+                        console.warn('[Exporter] Queue stopped: API rate limit did not clear after', MAX_GLOBAL_PAUSES, 'pauses')
+                        this.stop()
+                        return
+                    }
                 }
                 // Freeze the whole queue. Exponentially increase the pause so
                 // we back off harder if the first pause wasn't long enough.
@@ -180,15 +199,27 @@ export class RequestQueue<T> {
                 requestObject.blockRetries++
                 if (requestObject.blockRetries > MAX_403_RETRIES_PER_ITEM) {
                     // Still 403 after several pauses — this item is likely just forbidden.
-                    console.warn(`[Exporter] "${name}" skipped after ${MAX_403_RETRIES_PER_ITEM} forbidden (403) retries`)
-                    waitMs = 0 // skip — don't re-queue
+                    if (this.onItemExhausted && await this.onItemExhausted(name, error)) {
+                        requestObject.blockRetries = 0
+                        this.progress(name, 'retrying')
+                        this.queue.unshift(requestObject)
+                    }
+                    else {
+                        console.warn(`[Exporter] "${name}" skipped after ${MAX_403_RETRIES_PER_ITEM} forbidden (403) retries`)
+                    }
+                    waitMs = 0
                 }
                 else {
                     this.globalPauses++
                     if (this.globalPauses > MAX_GLOBAL_PAUSES) {
-                        console.warn('[Exporter] Queue stopped: API kept responding 403 after', MAX_GLOBAL_PAUSES, 'pauses')
-                        this.stop()
-                        return
+                        if (this.onPausesExhausted && await this.onPausesExhausted(error)) {
+                            this.globalPauses = 1 // keep going — restart the pause escalation
+                        }
+                        else {
+                            console.warn('[Exporter] Queue stopped: API kept responding 403 after', MAX_GLOBAL_PAUSES, 'pauses')
+                            this.stop()
+                            return
+                        }
                     }
                     const pauseMs = DEFAULT_403_PAUSE_MS * this.globalPauses
                     this.pauseUntil = Date.now() + pauseMs
@@ -203,8 +234,17 @@ export class RequestQueue<T> {
                 console.error(`[Exporter] "${name}" failed:`, error)
                 requestObject.retries++
                 if (requestObject.retries > MAX_RETRIES) {
-                    console.warn(`[Exporter] "${name}" skipped after ${MAX_RETRIES} retries`)
-                    waitMs = 0 // skip — don't re-queue
+                    if (this.onItemExhausted && await this.onItemExhausted(name, error)) {
+                        requestObject.retries = 0
+                        this.backoff = this.minBackoff
+                        this.progress(name, 'retrying')
+                        this.queue.unshift(requestObject)
+                        waitMs = this.backoff
+                    }
+                    else {
+                        console.warn(`[Exporter] "${name}" skipped after ${MAX_RETRIES} retries`)
+                        waitMs = 0 // skip — don't re-queue
+                    }
                 }
                 else {
                     this.backoff = Math.min(this.backoff * this.backoffMultiplier, this.maxBackoff)

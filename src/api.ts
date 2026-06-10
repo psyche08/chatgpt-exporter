@@ -453,20 +453,25 @@ export async function getCurrentChatId(): Promise<string> {
 }
 
 async function fetchImageFromPointer(uri: string) {
-    const pointer = uri.replace('sediment://', '')
-    const imageDetails = await fetchApi<ApiFileDownload>(fileDownloadApi(pointer))
-    if (imageDetails.status === 'error') {
-        console.error('Failed to fetch image asset', imageDetails.error_code, imageDetails.error_message)
-        return null
-    }
+    const pointer = uri.replace(/^(?:sediment|file-service):\/\//, '')
+    // Retry the whole sequence: a fresh download_url is fetched on each attempt,
+    // so an expired/blocked URL from a previous attempt can't poison the retry.
+    return withRetry(async () => {
+        const imageDetails = await fetchApi<ApiFileDownload>(fileDownloadApi(pointer))
+        if (imageDetails.status === 'error') {
+            console.error('Failed to fetch image asset', imageDetails.error_code, imageDetails.error_message)
+            return null
+        }
 
-    const image = await fetch(imageDetails.download_url)
-    const blob = await image.blob()
-    const base64 = await blobToDataURL(blob)
-    return base64.replace(/^data:.*?;/, `data:${image.headers.get('content-type')};`)
+        const image = await fetch(imageDetails.download_url)
+        if (!image.ok) throw new HttpError(image.status, image.statusText)
+        const blob = await image.blob()
+        const base64 = await blobToDataURL(blob)
+        return base64.replace(/^data:.*?;/, `data:${image.headers.get('content-type')};`)
+    }, { maxAttempts: 3 })
 }
 
-/** replaces `sediment://` pointers with data uris containing the image */
+/** replaces `sediment://` / `file-service://` pointers with data uris containing the image */
 /** avoid errors in parsing multimodal parts we don't understand */
 async function replaceImageAssets(conversation: ApiConversation): Promise<void> {
     const isMultiModalInputImage = (part: any): part is MultiModalInputImage => {
@@ -476,7 +481,8 @@ async function replaceImageAssets(conversation: ApiConversation): Promise<void> 
         && part.content_type === 'image_asset_pointer'
         && 'asset_pointer' in part
         && typeof part.asset_pointer === 'string'
-        && part.asset_pointer.startsWith('sediment://')
+        // generated images use sediment://, user-uploaded ones use file-service://
+        && /^(?:sediment|file-service):\/\//.test(part.asset_pointer)
     }
 
     const imageAssets = Object.values(conversation.mapping).flatMap((node) => {
@@ -593,12 +599,16 @@ export async function fetchConversationsPage(
     position: number | string,
     limit: number,
     onRetryWait?: (waitMs: number, error: Error) => void,
+    onRetryExhausted?: (error: Error) => boolean | Promise<boolean>,
 ): Promise<ApiConversations> {
     return withRetry(
         () => project === null
             ? fetchConversations(typeof position === 'number' ? position : 0, limit)
             : fetchProjectConversations(project, position, limit),
-        { onWait: (waitMs, error) => onRetryWait?.(waitMs, error) },
+        {
+            onWait: (waitMs, error) => onRetryWait?.(waitMs, error),
+            onExhausted: error => onRetryExhausted?.(error) ?? false,
+        },
     )
 }
 
@@ -608,6 +618,7 @@ export async function fetchAllConversations(
     onBatch?: (batch: ApiConversationItem[]) => void,
     onHasMore?: (hasMore: boolean) => void,
     onRetryWait?: (waitMs: number, error: Error) => void,
+    onRetryExhausted?: (error: Error) => boolean | Promise<boolean>,
 ): Promise<{ conversations: ApiConversationItem[]; nextOffset: number; nextCursor: string | null }> {
     const conversations: ApiConversationItem[] = []
     // The list is ordered by update_time and can shift while we paginate, so
@@ -625,7 +636,10 @@ export async function fetchAllConversations(
             () => project === null
                 ? fetchConversations(offset, limit)
                 : fetchProjectConversations(project, cursor, limit),
-            { onWait: (waitMs, error) => onRetryWait?.(waitMs, error) },
+            {
+                onWait: (waitMs, error) => onRetryWait?.(waitMs, error),
+                onExhausted: error => onRetryExhausted?.(error) ?? false,
+            },
         )
         if (!result.items) {
             // Handle potential API errors or empty responses
@@ -751,19 +765,32 @@ function retryWaitMs(error: unknown, attempt: number): number | null {
 /**
  * Run `fn`, waiting and retrying when it fails with a transient error
  * (429 rate limit, 403 Cloudflare block, 5xx, network failure).
+ *
+ * `onExhausted` is consulted once the automatic attempts run out: return true
+ * to grant a fresh round of retries (e.g. after asking the user), false to
+ * give up and rethrow.
  */
 export async function withRetry<T>(
     fn: () => Promise<T>,
-    options: { maxAttempts?: number; onWait?: (waitMs: number, error: Error, attempt: number) => void } = {},
+    options: {
+        maxAttempts?: number
+        onWait?: (waitMs: number, error: Error, attempt: number) => void
+        onExhausted?: (error: Error, attempts: number) => boolean | Promise<boolean>
+    } = {},
 ): Promise<T> {
-    const { maxAttempts = 4, onWait } = options
+    const { maxAttempts = 4, onWait, onExhausted } = options
     for (let attempt = 1; ; attempt++) {
         try {
             return await fn()
         }
         catch (error) {
             const waitMs = retryWaitMs(error, attempt)
-            if (waitMs == null || attempt >= maxAttempts) throw error
+            if (waitMs == null) throw error
+            if (attempt >= maxAttempts) {
+                if (!(onExhausted && await onExhausted(error as Error, attempt))) throw error
+                attempt = 0 // granted another round — the loop increment makes it 1
+                continue
+            }
             console.warn(`[Exporter] Request failed (attempt ${attempt}/${maxAttempts}), retrying in ${Math.round(waitMs / 1000)}s:`, error)
             onWait?.(waitMs, error as Error, attempt)
             await sleep(waitMs)
