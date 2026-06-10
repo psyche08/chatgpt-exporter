@@ -3,7 +3,7 @@
 // @name:zh-CN         ChatGPT Exporter
 // @name:zh-TW         ChatGPT Exporter
 // @namespace          pionxzh
-// @version            2.34.0
+// @version            2.34.1
 // @author             pionxzh
 // @description        Export ChatGPT conversations with one click — backup & share effortlessly!
 // @description:zh-CN  一键导出 ChatGPT 对话，轻松备份与分享
@@ -22390,6 +22390,9 @@ ${content2}`;
           this.progress(name, "rate_limited", Math.round(pauseMs / 1e3));
           console.warn(`[Exporter] Rate limited (429). Pausing queue for ${Math.round(pauseMs / 1e3)}s (pause #${this.globalPauses})`);
           this.queue.unshift(requestObject);
+          waitMs = 0;
+        } else if (error2 instanceof HttpError && (error2.status === 404 || error2.status === 410)) {
+          console.warn(`[Exporter] "${name}" skipped: not found (${error2.status})`);
           waitMs = 0;
         } else if (error2 instanceof HttpError && error2.status === 403) {
           requestObject.blockRetries++;
