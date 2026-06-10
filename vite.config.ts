@@ -57,9 +57,14 @@ export default defineConfig({
                 ],
                 'icon': 'https://chatgpt.com/favicon.ico',
                 'run-at': 'document-end',
+                // Auto-update: the manager polls updateURL (lightweight meta file);
+                // when @version there is newer it installs from downloadURL.
+                'updateURL': 'https://raw.githubusercontent.com/psyche08/chatgpt-exporter/master/dist/chatgpt.meta.js',
+                'downloadURL': 'https://raw.githubusercontent.com/psyche08/chatgpt-exporter/master/dist/chatgpt.user.js',
             },
             build: {
                 fileName: 'chatgpt.user.js',
+                metaFileName: true,
                 externalGlobals: [
                     ['jszip', cdn.jsdelivr('JSZip', 'dist/jszip.min.js')],
                     ['html2canvas', cdn.jsdelivr('html2canvas', 'dist/html2canvas.min.js')],
