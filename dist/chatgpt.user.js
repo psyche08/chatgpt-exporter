@@ -3,7 +3,7 @@
 // @name:zh-CN         ChatGPT Exporter
 // @name:zh-TW         ChatGPT Exporter
 // @namespace          pionxzh
-// @version            2.33.0
+// @version            2.34.0
 // @author             pionxzh
 // @description        Export ChatGPT conversations with one click — backup & share effortlessly!
 // @description:zh-CN  一键导出 ChatGPT 对话，轻松备份与分享
@@ -1423,20 +1423,23 @@ html {
     throw new Error("No chat id found.");
   }
   async function fetchImageFromPointer(uri) {
-    const pointer = uri.replace("sediment://", "");
-    const imageDetails = await fetchApi(fileDownloadApi(pointer));
-    if (imageDetails.status === "error") {
-      console.error("Failed to fetch image asset", imageDetails.error_code, imageDetails.error_message);
-      return null;
-    }
-    const image2 = await fetch(imageDetails.download_url);
-    const blob = await image2.blob();
-    const base64 = await blobToDataURL(blob);
-    return base64.replace(/^data:.*?;/, `data:${image2.headers.get("content-type")};`);
+    const pointer = uri.replace(/^(?:sediment|file-service):\/\//, "");
+    return withRetry(async () => {
+      const imageDetails = await fetchApi(fileDownloadApi(pointer));
+      if (imageDetails.status === "error") {
+        console.error("Failed to fetch image asset", imageDetails.error_code, imageDetails.error_message);
+        return null;
+      }
+      const image2 = await fetch(imageDetails.download_url);
+      if (!image2.ok) throw new HttpError(image2.status, image2.statusText);
+      const blob = await image2.blob();
+      const base64 = await blobToDataURL(blob);
+      return base64.replace(/^data:.*?;/, `data:${image2.headers.get("content-type")};`);
+    }, { maxAttempts: 3 });
   }
   async function replaceImageAssets(conversation) {
     const isMultiModalInputImage = (part) => {
-      return typeof part === "object" && part !== null && "content_type" in part && part.content_type === "image_asset_pointer" && "asset_pointer" in part && typeof part.asset_pointer === "string" && part.asset_pointer.startsWith("sediment://");
+      return typeof part === "object" && part !== null && "content_type" in part && part.content_type === "image_asset_pointer" && "asset_pointer" in part && typeof part.asset_pointer === "string" && /^(?:sediment|file-service):\/\//.test(part.asset_pointer);
     };
     const imageAssets = Object.values(conversation.mapping).flatMap((node2) => {
       if (!node2.message) return [];
@@ -1521,13 +1524,16 @@ html {
     };
   }
   const GIZMO_PAGE_LIMIT = 50;
-  async function fetchConversationsPage(project, position2, limit, onRetryWait) {
+  async function fetchConversationsPage(project, position2, limit, onRetryWait, onRetryExhausted) {
     return withRetry(
       () => project === null ? fetchConversations(typeof position2 === "number" ? position2 : 0, limit) : fetchProjectConversations(project, position2, limit),
-      { onWait: (waitMs, error2) => onRetryWait == null ? void 0 : onRetryWait(waitMs, error2) }
+      {
+        onWait: (waitMs, error2) => onRetryWait == null ? void 0 : onRetryWait(waitMs, error2),
+        onExhausted: (error2) => (onRetryExhausted == null ? void 0 : onRetryExhausted(error2)) ?? false
+      }
     );
   }
-  async function fetchAllConversations(project = null, maxConversations = 1e3, onBatch, onHasMore, onRetryWait) {
+  async function fetchAllConversations(project = null, maxConversations = 1e3, onBatch, onHasMore, onRetryWait, onRetryExhausted) {
     const conversations = [];
     const seen = /* @__PURE__ */ new Set();
     const limit = project === null ? 100 : GIZMO_PAGE_LIMIT;
@@ -1538,7 +1544,10 @@ html {
     while (true) {
       const result = await withRetry(
         () => project === null ? fetchConversations(offset, limit) : fetchProjectConversations(project, cursor, limit),
-        { onWait: (waitMs, error2) => onRetryWait == null ? void 0 : onRetryWait(waitMs, error2) }
+        {
+          onWait: (waitMs, error2) => onRetryWait == null ? void 0 : onRetryWait(waitMs, error2),
+          onExhausted: (error2) => (onRetryExhausted == null ? void 0 : onRetryExhausted(error2)) ?? false
+        }
       );
       if (!result.items) {
         console.warn("fetchAllConversations received no items at offset:", offset);
@@ -1611,13 +1620,18 @@ html {
     return null;
   }
   async function withRetry(fn2, options = {}) {
-    const { maxAttempts = 4, onWait } = options;
+    const { maxAttempts = 4, onWait, onExhausted } = options;
     for (let attempt = 1; ; attempt++) {
       try {
         return await fn2();
       } catch (error2) {
         const waitMs = retryWaitMs(error2, attempt);
-        if (waitMs == null || attempt >= maxAttempts) throw error2;
+        if (waitMs == null) throw error2;
+        if (attempt >= maxAttempts) {
+          if (!(onExhausted && await onExhausted(error2, attempt))) throw error2;
+          attempt = 0;
+          continue;
+        }
         console.warn(`[Exporter] Request failed (attempt ${attempt}/${maxAttempts}), retrying in ${Math.round(waitMs / 1e3)}s:`, error2);
         onWait == null ? void 0 : onWait(waitMs, error2, attempt);
         await sleep(waitMs);
@@ -22285,6 +22299,18 @@ ${content2}`;
       __publicField(this, "pauseUntil", 0);
       /** How many global rate-limit pauses have been applied so far */
       __publicField(this, "globalPauses", 0);
+      /**
+       * Consulted when a single item has exhausted its automatic retries.
+       * Return true to grant the item a fresh round of retries (e.g. after
+       * asking the user), false to skip it. When absent the item is skipped.
+       */
+      __publicField(this, "onItemExhausted");
+      /**
+       * Consulted when the whole queue has been paused MAX_GLOBAL_PAUSES times
+       * without recovering. Return true to keep waiting and retrying (the pause
+       * escalation restarts), false to stop the queue. When absent it stops.
+       */
+      __publicField(this, "onPausesExhausted");
       this.minBackoff = minBackoff;
       this.maxBackoff = maxBackoff;
       this.backoff = minBackoff;
@@ -22348,9 +22374,13 @@ ${content2}`;
         if (error2 instanceof RateLimitError) {
           this.globalPauses++;
           if (this.globalPauses > MAX_GLOBAL_PAUSES) {
-            console.warn("[Exporter] Queue stopped: API rate limit did not clear after", MAX_GLOBAL_PAUSES, "pauses");
-            this.stop();
-            return;
+            if (this.onPausesExhausted && await this.onPausesExhausted(error2)) {
+              this.globalPauses = 1;
+            } else {
+              console.warn("[Exporter] Queue stopped: API rate limit did not clear after", MAX_GLOBAL_PAUSES, "pauses");
+              this.stop();
+              return;
+            }
           }
           const pauseMs = Math.max(
             error2.retryAfterMs,
@@ -22364,14 +22394,24 @@ ${content2}`;
         } else if (error2 instanceof HttpError && error2.status === 403) {
           requestObject.blockRetries++;
           if (requestObject.blockRetries > MAX_403_RETRIES_PER_ITEM) {
-            console.warn(`[Exporter] "${name}" skipped after ${MAX_403_RETRIES_PER_ITEM} forbidden (403) retries`);
+            if (this.onItemExhausted && await this.onItemExhausted(name, error2)) {
+              requestObject.blockRetries = 0;
+              this.progress(name, "retrying");
+              this.queue.unshift(requestObject);
+            } else {
+              console.warn(`[Exporter] "${name}" skipped after ${MAX_403_RETRIES_PER_ITEM} forbidden (403) retries`);
+            }
             waitMs = 0;
           } else {
             this.globalPauses++;
             if (this.globalPauses > MAX_GLOBAL_PAUSES) {
-              console.warn("[Exporter] Queue stopped: API kept responding 403 after", MAX_GLOBAL_PAUSES, "pauses");
-              this.stop();
-              return;
+              if (this.onPausesExhausted && await this.onPausesExhausted(error2)) {
+                this.globalPauses = 1;
+              } else {
+                console.warn("[Exporter] Queue stopped: API kept responding 403 after", MAX_GLOBAL_PAUSES, "pauses");
+                this.stop();
+                return;
+              }
             }
             const pauseMs = DEFAULT_403_PAUSE_MS * this.globalPauses;
             this.pauseUntil = Date.now() + pauseMs;
@@ -22384,8 +22424,16 @@ ${content2}`;
           console.error(`[Exporter] "${name}" failed:`, error2);
           requestObject.retries++;
           if (requestObject.retries > MAX_RETRIES) {
-            console.warn(`[Exporter] "${name}" skipped after ${MAX_RETRIES} retries`);
-            waitMs = 0;
+            if (this.onItemExhausted && await this.onItemExhausted(name, error2)) {
+              requestObject.retries = 0;
+              this.backoff = this.minBackoff;
+              this.progress(name, "retrying");
+              this.queue.unshift(requestObject);
+              waitMs = this.backoff;
+            } else {
+              console.warn(`[Exporter] "${name}" skipped after ${MAX_RETRIES} retries`);
+              waitMs = 0;
+            }
           } else {
             this.backoff = Math.min(this.backoff * this.backoffMultiplier, this.maxBackoff);
             waitMs = this.backoff;
@@ -23081,6 +23129,26 @@ ${content2}`;
       });
       return () => off();
     }, [deleteQueue, selected, t2]);
+    p$6(() => {
+      const itemExhausted = (name, error22) => {
+        const msg = error22 instanceof Error ? error22.message : String(error22);
+        return confirm(`"${name}" keeps failing (${msg}).
+
+OK: keep retrying this item
+Cancel: skip it and continue`);
+      };
+      const pausesExhausted = (error22) => {
+        const msg = error22 instanceof Error ? error22.message : String(error22);
+        return confirm(`The API keeps blocking requests (${msg}) even after several long pauses.
+
+OK: keep waiting and retrying
+Cancel: stop here (already exported parts are kept)`);
+      };
+      for (const queue of [requestQueue, archiveQueue, deleteQueue]) {
+        queue.onItemExhausted = itemExhausted;
+        queue.onPausesExhausted = pausesExhausted;
+      }
+    }, [requestQueue, archiveQueue, deleteQueue]);
     const cancelExport = T$4(() => {
       cancelledRef.current = true;
       requestQueue.stop();
@@ -23182,7 +23250,11 @@ ${content2}`;
         },
         (waitMs) => {
           if (alive()) setLoadWaitSecs(Math.ceil(waitMs / 1e3));
-        }
+        },
+        (error22) => alive() && confirm(`Loading the conversation list keeps failing (${error22.message}).
+
+OK: keep retrying
+Cancel: stop loading (conversations loaded so far are kept)`)
       ).then((result) => {
         if (!alive()) return;
         nextPositionRef.current = { offset: result.nextOffset, cursor: result.nextCursor };
@@ -23206,7 +23278,11 @@ ${content2}`;
           selectedProjectId,
           selectedProjectId ? pos.cursor ?? 0 : pos.offset,
           limit,
-          (waitMs) => setLoadWaitSecs(Math.ceil(waitMs / 1e3))
+          (waitMs) => setLoadWaitSecs(Math.ceil(waitMs / 1e3)),
+          (error22) => confirm(`Loading more conversations keeps failing (${error22.message}).
+
+OK: keep retrying
+Cancel: stop loading`)
         );
         nextPositionRef.current = {
           offset: pos.offset + page.items.length,
