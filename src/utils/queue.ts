@@ -193,6 +193,12 @@ export class RequestQueue<T> {
                 this.queue.unshift(requestObject)
                 waitMs = 0 // the sleep is handled at the top of the next process() call
             }
+            else if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
+                // The conversation no longer exists (deleted or inaccessible).
+                // Retrying can't help — skip immediately without asking the user.
+                console.warn(`[Exporter] "${name}" skipped: not found (${error.status})`)
+                waitMs = 0 // skip — don't re-queue
+            }
             else if (error instanceof HttpError && error.status === 403) {
                 // A 403 burst usually means a Cloudflare block that affects every
                 // request — freeze the whole queue like a 429, with a shorter pause.
