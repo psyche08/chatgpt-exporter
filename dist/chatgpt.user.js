@@ -3,13 +3,15 @@
 // @name:zh-CN         ChatGPT Exporter
 // @name:zh-TW         ChatGPT Exporter
 // @namespace          pionxzh
-// @version            2.32.2
+// @version            2.33.0
 // @author             pionxzh
 // @description        Export ChatGPT conversations with one click — backup & share effortlessly!
 // @description:zh-CN  一键导出 ChatGPT 对话，轻松备份与分享
 // @description:zh-TW  一鍵導出 ChatGPT 對話，輕鬆備份與分享
 // @license            MIT
 // @icon               https://chatgpt.com/favicon.ico
+// @downloadURL        https://raw.githubusercontent.com/psyche08/chatgpt-exporter/master/dist/chatgpt.user.js
+// @updateURL          https://raw.githubusercontent.com/psyche08/chatgpt-exporter/master/dist/chatgpt.meta.js
 // @match              https://chat.openai.com/
 // @match              https://chat.openai.com/?*
 // @match              https://chat.openai.com/c/*
@@ -1327,6 +1329,80 @@ html {
     };
     return memorized;
   }
+  function noop$1() {
+  }
+  function nonNullable(x2) {
+    return x2 != null;
+  }
+  function onloadSafe(fn2) {
+    if (document.readyState === "complete") {
+      fn2();
+    } else {
+      window.addEventListener("load", fn2);
+    }
+  }
+  const _WORKER_SRC = "onmessage=function(e){setTimeout(function(){postMessage(e.data)},e.data.ms)}";
+  let _sleepWorker = null;
+  let _sleepWorkerFailed = false;
+  const _pendingResolves = /* @__PURE__ */ new Map();
+  let _sleepIdCounter = 0;
+  function _getSleepWorker() {
+    if (_sleepWorkerFailed) return null;
+    if (_sleepWorker) return _sleepWorker;
+    try {
+      const blob = new Blob([_WORKER_SRC], { type: "application/javascript" });
+      const url = URL.createObjectURL(blob);
+      const w2 = new Worker(url);
+      URL.revokeObjectURL(url);
+      w2.onmessage = (e2) => {
+        const resolve = _pendingResolves.get(e2.data.id);
+        if (resolve) {
+          _pendingResolves.delete(e2.data.id);
+          resolve();
+        }
+      };
+      w2.onerror = () => {
+        _sleepWorkerFailed = true;
+        _sleepWorker = null;
+        for (const resolve of _pendingResolves.values()) resolve();
+        _pendingResolves.clear();
+      };
+      _sleepWorker = w2;
+      return w2;
+    } catch {
+      _sleepWorkerFailed = true;
+      return null;
+    }
+  }
+  function sleep(ms) {
+    if (ms <= 0) return Promise.resolve();
+    const worker = _getSleepWorker();
+    if (!worker) return new Promise((resolve) => setTimeout(resolve, ms));
+    return new Promise((resolve) => {
+      const id = _sleepIdCounter++;
+      _pendingResolves.set(id, resolve);
+      worker.postMessage({ id, ms });
+    });
+  }
+  function dateStr(date = /* @__PURE__ */ new Date()) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
+  function timestamp() {
+    return (/* @__PURE__ */ new Date()).toISOString().replace(/:/g, "-").replace(/\..+/, "");
+  }
+  function getColorScheme() {
+    return document.documentElement.style.getPropertyValue("color-scheme");
+  }
+  function unixTimestampToISOString(timestamp2) {
+    if (!timestamp2) return "";
+    return new Date(timestamp2 * 1e3).toISOString();
+  }
+  function jsonlStringify(list2) {
+    return list2.map((msg) => JSON.stringify(msg)).join("\n");
+  }
   const sessionApi = _default(baseUrl, "/api/auth/session");
   const conversationApi = (id) => _default(apiUrl, "/conversation/:id", { id });
   const conversationsApi = (offset, limit) => _default(apiUrl, "/conversations", { offset, limit });
@@ -1444,40 +1520,50 @@ html {
       cursor: nextCursor ?? null
     };
   }
-  async function fetchConversationsPage(project, offset, limit) {
-    return fetchConversations(offset, limit, project);
+  const GIZMO_PAGE_LIMIT = 50;
+  async function fetchConversationsPage(project, position2, limit, onRetryWait) {
+    return withRetry(
+      () => project === null ? fetchConversations(typeof position2 === "number" ? position2 : 0, limit) : fetchProjectConversations(project, position2, limit),
+      { onWait: (waitMs, error2) => onRetryWait == null ? void 0 : onRetryWait(waitMs, error2) }
+    );
   }
-  async function fetchAllConversations(project = null, maxConversations = 1e3, onBatch, onHasMore) {
+  async function fetchAllConversations(project = null, maxConversations = 1e3, onBatch, onHasMore, onRetryWait) {
     const conversations = [];
-    const limit = project === null ? 100 : 50;
+    const seen = /* @__PURE__ */ new Set();
+    const limit = project === null ? 100 : GIZMO_PAGE_LIMIT;
     let offset = 0;
     let cursor = 0;
+    let nextOffset = 0;
+    let nextCursor = null;
     while (true) {
-      try {
-        const result2 = project === null ? await fetchConversations(offset, limit) : await fetchProjectConversations(project, cursor, limit);
-        if (!result2.items) {
-          console.warn("fetchAllConversations received no items at offset:", offset);
-          break;
-        }
-        conversations.push(...result2.items);
-        if (result2.items.length === 0) break;
-        onBatch == null ? void 0 : onBatch(result2.items);
-        if (result2.total == null && result2.cursor == null) break;
-        if (result2.total !== null && offset + limit >= result2.total) break;
-        if (conversations.length >= maxConversations) break;
-        if (result2.cursor != null) {
-          cursor = result2.cursor;
-        } else {
-          offset += limit;
-        }
-      } catch (error2) {
-        console.error("Error fetching conversations batch:", error2);
+      const result = await withRetry(
+        () => project === null ? fetchConversations(offset, limit) : fetchProjectConversations(project, cursor, limit),
+        { onWait: (waitMs, error2) => onRetryWait == null ? void 0 : onRetryWait(waitMs, error2) }
+      );
+      if (!result.items) {
+        console.warn("fetchAllConversations received no items at offset:", offset);
         break;
       }
+      nextOffset = offset + result.items.length;
+      nextCursor = result.cursor ?? null;
+      const novel = result.items.filter((item) => !seen.has(item.id));
+      for (const item of novel) seen.add(item.id);
+      conversations.push(...novel);
+      if (novel.length > 0) onBatch == null ? void 0 : onBatch(novel);
+      if (result.items.length === 0) break;
+      if (result.total == null && result.cursor == null) break;
+      if (result.total !== null && offset + limit >= result.total) break;
+      if (conversations.length >= maxConversations) break;
+      if (result.cursor != null) {
+        if (result.cursor === cursor) break;
+        cursor = result.cursor;
+      } else {
+        offset += limit;
+      }
     }
-    const result = conversations.slice(0, maxConversations);
-    onHasMore == null ? void 0 : onHasMore(result.length >= maxConversations);
-    return result;
+    const sliced = conversations.slice(0, maxConversations);
+    onHasMore == null ? void 0 : onHasMore(sliced.length >= maxConversations);
+    return { conversations: sliced, nextOffset, nextCursor };
   }
   async function archiveConversation(chatId) {
     const url = conversationApi(chatId);
@@ -1497,14 +1583,45 @@ html {
     });
     return success;
   }
-  class RateLimitError extends Error {
+  class HttpError extends Error {
+    constructor(status, statusText) {
+      super(statusText ? `HTTP ${status} ${statusText}` : `HTTP ${status}`);
+      this.status = status;
+      this.name = "HttpError";
+    }
+  }
+  class RateLimitError extends HttpError {
     constructor(retryAfterHeader) {
-      super("Too Many Requests (429)");
+      super(429, "Too Many Requests");
       /** Milliseconds to wait before retrying */
       __publicField(this, "retryAfterMs");
       this.name = "RateLimitError";
       const secs = retryAfterHeader != null ? Number.parseInt(retryAfterHeader, 10) : Number.NaN;
       this.retryAfterMs = Number.isFinite(secs) && secs > 0 ? secs * 1e3 : 3e4;
+    }
+  }
+  function retryWaitMs(error2, attempt) {
+    if (error2 instanceof RateLimitError) return Math.max(error2.retryAfterMs, 3e4 * attempt);
+    if (error2 instanceof HttpError) {
+      if (error2.status === 403) return 3e4 * attempt;
+      if (error2.status >= 500) return 2e3 * 2 ** (attempt - 1);
+      return null;
+    }
+    if (error2 instanceof TypeError) return 2e3 * 2 ** (attempt - 1);
+    return null;
+  }
+  async function withRetry(fn2, options = {}) {
+    const { maxAttempts = 4, onWait } = options;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await fn2();
+      } catch (error2) {
+        const waitMs = retryWaitMs(error2, attempt);
+        if (waitMs == null || attempt >= maxAttempts) throw error2;
+        console.warn(`[Exporter] Request failed (attempt ${attempt}/${maxAttempts}), retrying in ${Math.round(waitMs / 1e3)}s:`, error2);
+        onWait == null ? void 0 : onWait(waitMs, error2, attempt);
+        await sleep(waitMs);
+      }
     }
   }
   const RATE_LIMIT_HEADERS = [
@@ -1543,7 +1660,7 @@ html {
       if (response.status === 429) {
         throw new RateLimitError(response.headers.get("Retry-After"));
       }
-      throw new Error(response.statusText);
+      throw new HttpError(response.status, response.statusText);
     }
     return response.json();
   }
@@ -7896,7 +8013,7 @@ html {
       return false;
     }
   }
-  function noop$1() {
+  function noop() {
   }
   function bindMemberFunctions(inst) {
     var mems = Object.getOwnPropertyNames(Object.getPrototypeOf(inst));
@@ -8028,7 +8145,7 @@ html {
           });
         }
         this.format = this.options.interpolation.format;
-        if (!callback) callback = noop$1;
+        if (!callback) callback = noop;
         if (this.options.fallbackLng && !this.services.languageDetector && !this.options.lng) {
           var codes = this.services.languageUtils.getFallbackCodes(this.options.fallbackLng);
           if (codes.length > 0 && codes[0] !== "dev") this.options.lng = codes[0];
@@ -8075,7 +8192,7 @@ html {
       key: "loadResources",
       value: function loadResources(language) {
         var _this3 = this;
-        var callback = arguments.length > 1 && arguments[1] !== void 0 ? arguments[1] : noop$1;
+        var callback = arguments.length > 1 && arguments[1] !== void 0 ? arguments[1] : noop;
         var usedCallback = callback;
         var usedLng = typeof language === "string" ? language : this.language;
         if (typeof language === "function") usedCallback = language;
@@ -8116,7 +8233,7 @@ html {
         var deferred = defer();
         if (!lngs) lngs = this.languages;
         if (!ns) ns = this.options.ns;
-        if (!callback) callback = noop$1;
+        if (!callback) callback = noop;
         this.services.backendConnector.reload(lngs, ns, function(err) {
           deferred.resolve();
           callback(err);
@@ -8360,7 +8477,7 @@ html {
       value: function cloneInstance() {
         var _this8 = this;
         var options = arguments.length > 0 && arguments[0] !== void 0 ? arguments[0] : {};
-        var callback = arguments.length > 1 && arguments[1] !== void 0 ? arguments[1] : noop$1;
+        var callback = arguments.length > 1 && arguments[1] !== void 0 ? arguments[1] : noop;
         var mergedOptions = _objectSpread(_objectSpread(_objectSpread({}, this.options), options), {
           isClone: true
         });
@@ -10025,80 +10142,6 @@ html {
     return sanitize(output2, "");
   };
   const sanitize$1 = /* @__PURE__ */ getDefaultExportFromCjs(sanitizeFilename);
-  function noop() {
-  }
-  function nonNullable(x2) {
-    return x2 != null;
-  }
-  function onloadSafe(fn2) {
-    if (document.readyState === "complete") {
-      fn2();
-    } else {
-      window.addEventListener("load", fn2);
-    }
-  }
-  const _WORKER_SRC = "onmessage=function(e){setTimeout(function(){postMessage(e.data)},e.data.ms)}";
-  let _sleepWorker = null;
-  let _sleepWorkerFailed = false;
-  const _pendingResolves = /* @__PURE__ */ new Map();
-  let _sleepIdCounter = 0;
-  function _getSleepWorker() {
-    if (_sleepWorkerFailed) return null;
-    if (_sleepWorker) return _sleepWorker;
-    try {
-      const blob = new Blob([_WORKER_SRC], { type: "application/javascript" });
-      const url = URL.createObjectURL(blob);
-      const w2 = new Worker(url);
-      URL.revokeObjectURL(url);
-      w2.onmessage = (e2) => {
-        const resolve = _pendingResolves.get(e2.data.id);
-        if (resolve) {
-          _pendingResolves.delete(e2.data.id);
-          resolve();
-        }
-      };
-      w2.onerror = () => {
-        _sleepWorkerFailed = true;
-        _sleepWorker = null;
-        for (const resolve of _pendingResolves.values()) resolve();
-        _pendingResolves.clear();
-      };
-      _sleepWorker = w2;
-      return w2;
-    } catch {
-      _sleepWorkerFailed = true;
-      return null;
-    }
-  }
-  function sleep(ms) {
-    if (ms <= 0) return Promise.resolve();
-    const worker = _getSleepWorker();
-    if (!worker) return new Promise((resolve) => setTimeout(resolve, ms));
-    return new Promise((resolve) => {
-      const id = _sleepIdCounter++;
-      _pendingResolves.set(id, resolve);
-      worker.postMessage({ id, ms });
-    });
-  }
-  function dateStr(date = /* @__PURE__ */ new Date()) {
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, "0");
-    const day = String(date.getDate()).padStart(2, "0");
-    return `${year}-${month}-${day}`;
-  }
-  function timestamp() {
-    return (/* @__PURE__ */ new Date()).toISOString().replace(/:/g, "-").replace(/\..+/, "");
-  }
-  function getColorScheme() {
-    return document.documentElement.style.getPropertyValue("color-scheme");
-  }
-  function unixTimestampToISOString(timestamp2) {
-    if (!timestamp2) return "";
-    return new Date(timestamp2 * 1e3).toISOString();
-  }
-  function jsonlStringify(list2) {
-    return list2.map((msg) => JSON.stringify(msg)).join("\n");
-  }
   function downloadFile(filename, type, content2) {
     const blob = content2 instanceof Blob ? content2 : new Blob([content2], { type });
     const url = URL.createObjectURL(blob);
@@ -22222,6 +22265,8 @@ ${content2}`;
   const MAX_RETRIES = 5;
   const MAX_GLOBAL_PAUSES = 5;
   const DEFAULT_429_PAUSE_MS = 6e4;
+  const DEFAULT_403_PAUSE_MS = 15e3;
+  const MAX_403_RETRIES_PER_ITEM = 3;
   class RequestQueue {
     constructor(minBackoff, maxBackoff) {
       __publicField(this, "eventEmitter", EventEmitter());
@@ -22245,7 +22290,7 @@ ${content2}`;
       this.backoff = minBackoff;
     }
     add(requestObject) {
-      this.queue.push({ ...requestObject, retries: 0, rateRetries: 0 });
+      this.queue.push({ ...requestObject, retries: 0, blockRetries: 0 });
     }
     start() {
       if (this.status === "IDLE") {
@@ -22298,6 +22343,7 @@ ${content2}`;
         this.progress(name, "processing");
         this.backoff = this.minBackoff;
         requestObject.retries = 0;
+        this.globalPauses = 0;
       } catch (error2) {
         if (error2 instanceof RateLimitError) {
           this.globalPauses++;
@@ -22315,6 +22361,25 @@ ${content2}`;
           console.warn(`[Exporter] Rate limited (429). Pausing queue for ${Math.round(pauseMs / 1e3)}s (pause #${this.globalPauses})`);
           this.queue.unshift(requestObject);
           waitMs = 0;
+        } else if (error2 instanceof HttpError && error2.status === 403) {
+          requestObject.blockRetries++;
+          if (requestObject.blockRetries > MAX_403_RETRIES_PER_ITEM) {
+            console.warn(`[Exporter] "${name}" skipped after ${MAX_403_RETRIES_PER_ITEM} forbidden (403) retries`);
+            waitMs = 0;
+          } else {
+            this.globalPauses++;
+            if (this.globalPauses > MAX_GLOBAL_PAUSES) {
+              console.warn("[Exporter] Queue stopped: API kept responding 403 after", MAX_GLOBAL_PAUSES, "pauses");
+              this.stop();
+              return;
+            }
+            const pauseMs = DEFAULT_403_PAUSE_MS * this.globalPauses;
+            this.pauseUntil = Date.now() + pauseMs;
+            this.progress(name, "rate_limited", Math.round(pauseMs / 1e3));
+            console.warn(`[Exporter] Forbidden (403). Pausing queue for ${Math.round(pauseMs / 1e3)}s (pause #${this.globalPauses})`);
+            this.queue.unshift(requestObject);
+            waitMs = 0;
+          }
         } else {
           console.error(`[Exporter] "${name}" failed:`, error2);
           requestObject.retries++;
@@ -22578,6 +22643,11 @@ ${content2}`;
       result.push(arr.slice(i2, i2 + size));
     }
     return result;
+  }
+  function appendUnique(prev, items) {
+    const seen = new Set(prev.map((c2) => c2.id));
+    const novel = items.filter((c2) => !seen.has(c2.id));
+    return novel.length === 0 ? prev : [...prev, ...novel];
   }
   function formatConvDate(time) {
     if (!time) return "—";
@@ -22891,10 +22961,12 @@ ${content2}`;
     const [processing, setProcessing] = h$4(false);
     const [selected, setSelected] = h$4([]);
     const [exportType, setExportType] = h$4(exportAllOptions[0].label);
-    const disabled = processing || !!error2 || selected.length === 0;
+    const disabled = processing || !!error2 && conversations.length === 0 || selected.length === 0;
     const [hasMore, setHasMore] = h$4(false);
     const [loadingMore, setLoadingMore] = h$4(false);
     const [totalAvailable, setTotalAvailable] = h$4(null);
+    const [loadWaitSecs, setLoadWaitSecs] = h$4(null);
+    const nextPositionRef = _({ offset: 0, cursor: null });
     const requestQueue = F$1(() => new RequestQueue(200, 1600), []);
     const archiveQueue = F$1(() => new RequestQueue(200, 1600), []);
     const deleteQueue = F$1(() => new RequestQueue(200, 1600), []);
@@ -23093,40 +23165,65 @@ ${content2}`;
       setApiConversations([]);
       setHasMore(false);
       setTotalAvailable(null);
+      setError("");
+      setLoadWaitSecs(null);
+      nextPositionRef.current = { offset: 0, cursor: null };
       setLoading(true);
       fetchAllConversations(
         selectedProjectId,
         exportAllLimit,
         (batch) => {
-          if (alive()) setApiConversations((prev) => [...prev, ...batch]);
+          if (!alive()) return;
+          setLoadWaitSecs(null);
+          setApiConversations((prev) => appendUnique(prev, batch));
         },
         (hasMore2) => {
           if (alive()) setHasMore(hasMore2);
+        },
+        (waitMs) => {
+          if (alive()) setLoadWaitSecs(Math.ceil(waitMs / 1e3));
         }
-      ).catch((err) => {
+      ).then((result) => {
+        if (!alive()) return;
+        nextPositionRef.current = { offset: result.nextOffset, cursor: result.nextCursor };
+      }).catch((err) => {
         if (!alive()) return;
         console.error("Error fetching conversations:", err);
         setError(err.message || "Failed to load conversations");
       }).finally(() => {
-        if (alive()) setLoading(false);
+        if (!alive()) return;
+        setLoading(false);
+        setLoadWaitSecs(null);
       });
     }, [exportAllLimit, selectedProjectId]);
     const loadMore = T$4(async () => {
       if (loadingMore) return;
       setLoadingMore(true);
       try {
-        const page = await fetchConversationsPage(selectedProjectId, apiConversations.length, EXPORT_OPERATION_BATCH);
-        setApiConversations((prev) => [...prev, ...page.items]);
+        const limit = selectedProjectId ? GIZMO_PAGE_LIMIT : EXPORT_OPERATION_BATCH;
+        const pos = nextPositionRef.current;
+        const page = await fetchConversationsPage(
+          selectedProjectId,
+          selectedProjectId ? pos.cursor ?? 0 : pos.offset,
+          limit,
+          (waitMs) => setLoadWaitSecs(Math.ceil(waitMs / 1e3))
+        );
+        nextPositionRef.current = {
+          offset: pos.offset + page.items.length,
+          cursor: page.cursor ?? null
+        };
+        setApiConversations((prev) => appendUnique(prev, page.items));
         if (page.total !== null) setTotalAvailable(page.total);
         setHasMore(
-          page.items.length >= EXPORT_OPERATION_BATCH && (page.total === null || apiConversations.length + page.items.length < page.total)
+          selectedProjectId ? page.cursor != null : page.total === null ? page.items.length >= limit : nextPositionRef.current.offset < page.total
         );
       } catch (err) {
         console.error("loadMore error", err);
       } finally {
         setLoadingMore(false);
+        setLoadWaitSecs(null);
       }
-    }, [loadingMore, apiConversations.length, selectedProjectId]);
+    }, [loadingMore, selectedProjectId]);
     const totalBatches = Math.ceil(selected.length / EXPORT_OPERATION_BATCH) || 1;
     const [probeStatus, setProbeStatus] = h$4(null);
     const [probeRetryAfterSecs, setProbeRetryAfterSecs] = h$4();
@@ -23201,6 +23298,7 @@ ${content2}`;
           error: error2
         }
       ),
+      loadWaitSecs !== null && /* @__PURE__ */ o$8("p", { className: "mt-1 text-xs text-amber-600 dark:text-amber-500", children: `⏳ Rate limited — retrying in ${loadWaitSecs}s` }),
       exportSource === "API" && !loading && !processing && hasMore && /* @__PURE__ */ o$8("div", { className: "flex items-center justify-center mt-2 mb-1 gap-2", children: [
         /* @__PURE__ */ o$8(
           "button",
@@ -23347,7 +23445,7 @@ ${content2}`;
   }
   function subscribe(callback) {
     const target = document.querySelector("title");
-    if (!target) return noop;
+    if (!target) return noop$1;
     const observer = new MutationObserver(callback);
     const config = { subtree: true, characterData: true, childList: true };
     observer.observe(target, config);
