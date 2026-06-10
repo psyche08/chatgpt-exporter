@@ -1,5 +1,5 @@
 import EventEmitter from 'mitt'
-import { RateLimitError } from '../api'
+import { HttpError, RateLimitError } from '../api'
 import { sleep } from './utils'
 
 type RequestFn<T> = () => Promise<T>
@@ -13,7 +13,7 @@ interface RequestObject<T> {
 /** Internal shape with per-item retry counters */
 interface InternalRequestObject<T> extends RequestObject<T> {
     retries: number // general error retries
-    rateRetries: number // 429-specific retries
+    blockRetries: number // 403 (Cloudflare block) pauses triggered by this item
 }
 
 export type RequestStatus = 'processing' | 'retrying' | 'rate_limited'
@@ -39,6 +39,13 @@ const MAX_GLOBAL_PAUSES = 5
  * Used when the API does not return a Retry-After header.
  */
 const DEFAULT_429_PAUSE_MS = 60_000
+/**
+ * Pause length (ms) applied to the whole queue on a 403.
+ * A 403 burst usually means a Cloudflare block that clears after a cool-down.
+ */
+const DEFAULT_403_PAUSE_MS = 15_000
+/** Max global pauses a single item may trigger via 403 before it is skipped */
+const MAX_403_RETRIES_PER_ITEM = 3
 
 export class RequestQueue<T> {
     private eventEmitter = EventEmitter<{
@@ -71,7 +78,7 @@ export class RequestQueue<T> {
     }
 
     add(requestObject: RequestObject<T>) {
-        this.queue.push({ ...requestObject, retries: 0, rateRetries: 0 })
+        this.queue.push({ ...requestObject, retries: 0, blockRetries: 0 })
     }
 
     start() {
@@ -141,6 +148,9 @@ export class RequestQueue<T> {
             this.progress(name, 'processing')
             this.backoff = this.minBackoff // reset on success
             requestObject.retries = 0
+            // A success means the rate limit / block cleared — restore the full
+            // pause budget so a long export isn't aborted by sporadic 429s.
+            this.globalPauses = 0
         }
         catch (error) {
             if (error instanceof RateLimitError) {
@@ -163,6 +173,31 @@ export class RequestQueue<T> {
                 // Put this item back — it will be retried after the pause clears
                 this.queue.unshift(requestObject)
                 waitMs = 0 // the sleep is handled at the top of the next process() call
+            }
+            else if (error instanceof HttpError && error.status === 403) {
+                // A 403 burst usually means a Cloudflare block that affects every
+                // request — freeze the whole queue like a 429, with a shorter pause.
+                requestObject.blockRetries++
+                if (requestObject.blockRetries > MAX_403_RETRIES_PER_ITEM) {
+                    // Still 403 after several pauses — this item is likely just forbidden.
+                    console.warn(`[Exporter] "${name}" skipped after ${MAX_403_RETRIES_PER_ITEM} forbidden (403) retries`)
+                    waitMs = 0 // skip — don't re-queue
+                }
+                else {
+                    this.globalPauses++
+                    if (this.globalPauses > MAX_GLOBAL_PAUSES) {
+                        console.warn('[Exporter] Queue stopped: API kept responding 403 after', MAX_GLOBAL_PAUSES, 'pauses')
+                        this.stop()
+                        return
+                    }
+                    const pauseMs = DEFAULT_403_PAUSE_MS * this.globalPauses
+                    this.pauseUntil = Date.now() + pauseMs
+                    this.progress(name, 'rate_limited', Math.round(pauseMs / 1000))
+                    console.warn(`[Exporter] Forbidden (403). Pausing queue for ${Math.round(pauseMs / 1000)}s (pause #${this.globalPauses})`)
+                    // Put this item back — it will be retried after the pause clears
+                    this.queue.unshift(requestObject)
+                    waitMs = 0 // the sleep is handled at the top of the next process() call
+                }
             }
             else {
                 console.error(`[Exporter] "${name}" failed:`, error)

@@ -1,7 +1,7 @@
 import * as Dialog from '@radix-ui/react-dialog'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks'
 import { useTranslation } from 'react-i18next'
-import { archiveConversation, deleteConversation, fetchAllConversations, fetchConversation, fetchConversationsPage, fetchProjects, probeApi } from '../api'
+import { GIZMO_PAGE_LIMIT, archiveConversation, deleteConversation, fetchAllConversations, fetchConversation, fetchConversationsPage, fetchProjects, probeApi } from '../api'
 import { EXPORT_OPERATION_BATCH } from '../constants'
 import { exportAllToHtml } from '../exporter/html'
 import { exportAllToJson, exportAllToOfficialJson } from '../exporter/json'
@@ -41,6 +41,16 @@ function chunkArray<T>(arr: T[], size: number): T[][] {
         result.push(arr.slice(i, i + size))
     }
     return result
+}
+
+/**
+ * Append only items whose id isn't already in the list — pagination pages can
+ * overlap when the conversation list shifts (it's ordered by update_time).
+ */
+function appendUnique(prev: ApiConversationItem[], items: ApiConversationItem[]): ApiConversationItem[] {
+    const seen = new Set(prev.map(c => c.id))
+    const novel = items.filter(c => !seen.has(c.id))
+    return novel.length === 0 ? prev : [...prev, ...novel]
 }
 
 /** Compact date label — always includes year to avoid ambiguity */
@@ -380,12 +390,21 @@ const DialogContent: FC<DialogContentProps> = ({ format }) => {
 
     const [selected, setSelected] = useState<ApiConversationItem[]>([])
     const [exportType, setExportType] = useState(exportAllOptions[0].label)
-    const disabled = processing || !!error || selected.length === 0
+    // A load error with a partially loaded list shouldn't block exporting what DID load
+    const disabled = processing || (!!error && conversations.length === 0) || selected.length === 0
 
     // "Load more" state
     const [hasMore, setHasMore] = useState(false)
     const [loadingMore, setLoadingMore] = useState(false)
     const [totalAvailable, setTotalAvailable] = useState<number | null>(null)
+    /** Seconds shown in the "rate limited — retrying" hint while the list loads */
+    const [loadWaitSecs, setLoadWaitSecs] = useState<number | null>(null)
+    /**
+     * True continuation point in the API list (raw offset / opaque cursor).
+     * The deduped list length drifts away from the real API offset, so "load
+     * more" must continue from here instead of `apiConversations.length`.
+     */
+    const nextPositionRef = useRef<{ offset: number; cursor: string | null }>({ offset: 0, cursor: null })
 
     const requestQueue = useMemo(() => new RequestQueue<ApiConversationWithId>(200, 1600), [])
     const archiveQueue = useMemo(() => new RequestQueue<boolean>(200, 1600), [])
@@ -613,31 +632,63 @@ const DialogContent: FC<DialogContentProps> = ({ format }) => {
         setApiConversations([])
         setHasMore(false)
         setTotalAvailable(null)
+        setError('')
+        setLoadWaitSecs(null)
+        nextPositionRef.current = { offset: 0, cursor: null }
         setLoading(true)
         fetchAllConversations(
             selectedProjectId,
             exportAllLimit,
-            (batch) => { if (alive()) setApiConversations(prev => [...prev, ...batch]) },
+            (batch) => {
+                if (!alive()) return
+                setLoadWaitSecs(null)
+                setApiConversations(prev => appendUnique(prev, batch))
+            },
             (hasMore) => { if (alive()) setHasMore(hasMore) },
+            (waitMs) => { if (alive()) setLoadWaitSecs(Math.ceil(waitMs / 1000)) },
         )
+            .then((result) => {
+                if (!alive()) return
+                nextPositionRef.current = { offset: result.nextOffset, cursor: result.nextCursor }
+            })
             .catch((err: Error) => {
                 if (!alive()) return
                 console.error('Error fetching conversations:', err)
                 setError(err.message || 'Failed to load conversations')
             })
-            .finally(() => { if (alive()) setLoading(false) })
+            .finally(() => {
+                if (!alive()) return
+                setLoading(false)
+                setLoadWaitSecs(null)
+            })
     }, [exportAllLimit, selectedProjectId])
 
     const loadMore = useCallback(async () => {
         if (loadingMore) return
         setLoadingMore(true)
         try {
-            const page = await fetchConversationsPage(selectedProjectId, apiConversations.length, EXPORT_OPERATION_BATCH)
-            setApiConversations(prev => [...prev, ...page.items])
+            const limit = selectedProjectId ? GIZMO_PAGE_LIMIT : EXPORT_OPERATION_BATCH
+            const pos = nextPositionRef.current
+            const page = await fetchConversationsPage(
+                selectedProjectId,
+                selectedProjectId ? (pos.cursor ?? 0) : pos.offset,
+                limit,
+                waitMs => setLoadWaitSecs(Math.ceil(waitMs / 1000)),
+            )
+            // Advance by the raw page, not the deduped result, so the next
+            // request continues from where the API actually left off
+            nextPositionRef.current = {
+                offset: pos.offset + page.items.length,
+                cursor: page.cursor ?? null,
+            }
+            setApiConversations(prev => appendUnique(prev, page.items))
             if (page.total !== null) setTotalAvailable(page.total)
             setHasMore(
-                page.items.length >= EXPORT_OPERATION_BATCH
-                && (page.total === null || apiConversations.length + page.items.length < page.total),
+                selectedProjectId
+                    ? page.cursor != null
+                    : page.total === null
+                        ? page.items.length >= limit
+                        : nextPositionRef.current.offset < page.total,
             )
         }
         catch (err) {
@@ -645,8 +696,9 @@ const DialogContent: FC<DialogContentProps> = ({ format }) => {
         }
         finally {
             setLoadingMore(false)
+            setLoadWaitSecs(null)
         }
-    }, [loadingMore, apiConversations.length, selectedProjectId])
+    }, [loadingMore, selectedProjectId])
 
     const totalBatches = Math.ceil(selected.length / EXPORT_OPERATION_BATCH) || 1
 
@@ -734,6 +786,13 @@ const DialogContent: FC<DialogContentProps> = ({ format }) => {
                 loading={loading}
                 error={error}
             />
+
+            {/* Wait-and-retry hint while the conversation list is loading */}
+            {loadWaitSecs !== null && (
+                <p className="mt-1 text-xs text-amber-600 dark:text-amber-500">
+                    {`⏳ Rate limited — retrying in ${loadWaitSecs}s`}
+                </p>
+            )}
 
             {/* Load-more button */}
             {exportSource === 'API' && !loading && !processing && hasMore && (

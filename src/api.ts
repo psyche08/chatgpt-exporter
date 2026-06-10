@@ -3,6 +3,7 @@ import { apiUrl, baseUrl } from './constants'
 import { getChatIdFromUrl, getConversationFromSharePage, getPageAccessToken, isSharePage } from './page'
 import { blobToDataURL } from './utils/dom'
 import { memorize } from './utils/memorize'
+import { sleep } from './utils/utils'
 
 interface ApiSession {
     accessToken: string
@@ -577,60 +578,88 @@ async function fetchProjectConversations(project: string, cursor: string | numbe
     }
 }
 
+/** Page size for the project (gizmo) conversations API — it caps pages lower than the main list. */
+export const GIZMO_PAGE_LIMIT = 50
+
 /**
- * Fetch a single page of conversations starting at `offset`.
+ * Fetch a single page of conversations.
+ * `position` is the numeric offset for the main list, or the opaque cursor
+ * returned by the previous page for project (gizmo) lists — 0 means first page.
  * Useful for "load more" functionality in the UI — call this after the initial
  * full load to append additional pages without re-fetching everything.
  */
 export async function fetchConversationsPage(
     project: string | null,
-    offset: number,
+    position: number | string,
     limit: number,
+    onRetryWait?: (waitMs: number, error: Error) => void,
 ): Promise<ApiConversations> {
-    return fetchConversations(offset, limit, project)
+    return withRetry(
+        () => project === null
+            ? fetchConversations(typeof position === 'number' ? position : 0, limit)
+            : fetchProjectConversations(project, position, limit),
+        { onWait: (waitMs, error) => onRetryWait?.(waitMs, error) },
+    )
 }
 
-export async function fetchAllConversations(project: string | null = null, maxConversations = 1000, onBatch?: (batch: ApiConversationItem[]) => void, onHasMore?: (hasMore: boolean) => void): Promise<ApiConversationItem[]> {
+export async function fetchAllConversations(
+    project: string | null = null,
+    maxConversations = 1000,
+    onBatch?: (batch: ApiConversationItem[]) => void,
+    onHasMore?: (hasMore: boolean) => void,
+    onRetryWait?: (waitMs: number, error: Error) => void,
+): Promise<{ conversations: ApiConversationItem[]; nextOffset: number; nextCursor: string | null }> {
     const conversations: ApiConversationItem[] = []
-    const limit = project === null ? 100 : 50 // gizmos api uses a smaller limit
+    // The list is ordered by update_time and can shift while we paginate, so
+    // the same conversation may appear on two pages — dedupe by id.
+    const seen = new Set<string>()
+    const limit = project === null ? 100 : GIZMO_PAGE_LIMIT
     let offset = 0
     let cursor: string | number = 0 // project conversations use alphanumeric cursors
+    let nextOffset = 0
+    let nextCursor: string | null = null
     while (true) {
-        try {
-            const result: ApiConversations = project === null
-                ? await fetchConversations(offset, limit)
-                : await fetchProjectConversations(project, cursor, limit)
-            if (!result.items) {
-                // Handle potential API errors or empty responses
-                console.warn('fetchAllConversations received no items at offset:', offset)
-                break
-            }
-            conversations.push(...result.items)
-            if (result.items.length === 0) break
-            onBatch?.(result.items)
-            // Stop if the API signals no more pages (no total count and no next cursor)
-            if (result.total == null && result.cursor == null) break
-            // Stop if we've reached the total reported by the API OR the user-defined limit
-            if (result.total !== null && offset + limit >= result.total) break
-            if (conversations.length >= maxConversations) break
-            // Use the alphanumeric cursor for project conversations, fall back to numeric offset otherwise
-            if (result.cursor != null) {
-                cursor = result.cursor
-            }
-            else {
-                offset += limit
-            }
-        }
-        catch (error) {
-            console.error('Error fetching conversations batch:', error)
+        // A page that still fails after withRetry's waits will throw — better to
+        // surface the error than to silently return a truncated list.
+        const result: ApiConversations = await withRetry(
+            () => project === null
+                ? fetchConversations(offset, limit)
+                : fetchProjectConversations(project, cursor, limit),
+            { onWait: (waitMs, error) => onRetryWait?.(waitMs, error) },
+        )
+        if (!result.items) {
+            // Handle potential API errors or empty responses
+            console.warn('fetchAllConversations received no items at offset:', offset)
             break
+        }
+        nextOffset = offset + result.items.length
+        nextCursor = result.cursor ?? null
+        const novel = result.items.filter(item => !seen.has(item.id))
+        for (const item of novel) seen.add(item.id)
+        conversations.push(...novel)
+        if (novel.length > 0) onBatch?.(novel)
+        // Termination checks use the raw page size: a page made entirely of
+        // duplicates (the list shifted under us) must not stop the pagination.
+        if (result.items.length === 0) break
+        // Stop if the API signals no more pages (no total count and no next cursor)
+        if (result.total == null && result.cursor == null) break
+        // Stop if we've reached the total reported by the API OR the user-defined limit
+        if (result.total !== null && offset + limit >= result.total) break
+        if (conversations.length >= maxConversations) break
+        // Use the alphanumeric cursor for project conversations, fall back to numeric offset otherwise
+        if (result.cursor != null) {
+            if (result.cursor === cursor) break // same cursor again — bail out instead of refetching forever
+            cursor = result.cursor
+        }
+        else {
+            offset += limit
         }
     }
     // Ensure we don't return more than the requested limit if the last batch pushed us over
-    const result = conversations.slice(0, maxConversations)
+    const sliced = conversations.slice(0, maxConversations)
     // Let the caller know whether the fetch was cut off by the user limit vs the API having no more data
-    onHasMore?.(result.length >= maxConversations)
-    return result
+    onHasMore?.(sliced.length >= maxConversations)
+    return { conversations: sliced, nextOffset, nextCursor }
 }
 
 /**
@@ -678,18 +707,67 @@ export async function deleteConversation(chatId: string): Promise<boolean> {
 }
 
 /**
+ * Thrown when the API responds with a non-2xx status.
+ * Carries the HTTP status code so callers can decide whether to retry.
+ */
+export class HttpError extends Error {
+    constructor(readonly status: number, statusText?: string) {
+        super(statusText ? `HTTP ${status} ${statusText}` : `HTTP ${status}`)
+        this.name = 'HttpError'
+    }
+}
+
+/**
  * Thrown when the API responds with 429 Too Many Requests.
  * Carries the wait time from the `Retry-After` header (or a safe default).
  */
-export class RateLimitError extends Error {
+export class RateLimitError extends HttpError {
     /** Milliseconds to wait before retrying */
     readonly retryAfterMs: number
     constructor(retryAfterHeader: string | null) {
-        super('Too Many Requests (429)')
+        super(429, 'Too Many Requests')
         this.name = 'RateLimitError'
         const secs = retryAfterHeader != null ? Number.parseInt(retryAfterHeader, 10) : Number.NaN
         // Default to 30 s if the header is missing or unparseable
         this.retryAfterMs = Number.isFinite(secs) && secs > 0 ? secs * 1000 : 30_000
+    }
+}
+
+/** How long to wait before retrying `error`, or null if it should not be retried. */
+function retryWaitMs(error: unknown, attempt: number): number | null {
+    if (error instanceof RateLimitError) return Math.max(error.retryAfterMs, 30_000 * attempt)
+    if (error instanceof HttpError) {
+        // Cloudflare blocks (403) usually clear after a cool-down; auth or
+        // not-found errors (401/404) won't get better by waiting.
+        if (error.status === 403) return 30_000 * attempt
+        if (error.status >= 500) return 2000 * 2 ** (attempt - 1)
+        return null
+    }
+    // fetch() rejects with a TypeError on network failures
+    if (error instanceof TypeError) return 2000 * 2 ** (attempt - 1)
+    return null
+}
+
+/**
+ * Run `fn`, waiting and retrying when it fails with a transient error
+ * (429 rate limit, 403 Cloudflare block, 5xx, network failure).
+ */
+export async function withRetry<T>(
+    fn: () => Promise<T>,
+    options: { maxAttempts?: number; onWait?: (waitMs: number, error: Error, attempt: number) => void } = {},
+): Promise<T> {
+    const { maxAttempts = 4, onWait } = options
+    for (let attempt = 1; ; attempt++) {
+        try {
+            return await fn()
+        }
+        catch (error) {
+            const waitMs = retryWaitMs(error, attempt)
+            if (waitMs == null || attempt >= maxAttempts) throw error
+            console.warn(`[Exporter] Request failed (attempt ${attempt}/${maxAttempts}), retrying in ${Math.round(waitMs / 1000)}s:`, error)
+            onWait?.(waitMs, error as Error, attempt)
+            await sleep(waitMs)
+        }
     }
 }
 
@@ -736,7 +814,7 @@ async function fetchApi<T>(url: string, options?: RequestInit): Promise<T> {
         if (response.status === 429) {
             throw new RateLimitError(response.headers.get('Retry-After'))
         }
-        throw new Error(response.statusText)
+        throw new HttpError(response.status, response.statusText)
     }
     return response.json()
 }
