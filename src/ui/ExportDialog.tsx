@@ -423,6 +423,15 @@ const DialogContent: FC<DialogContentProps> = ({ format }) => {
     const pendingBatchesRef = useRef<ApiConversationItem[][]>([])
     const batchIndexRef = useRef(0)
     const totalBatchesRef = useRef(0)
+    /**
+     * Global index (0-based) of the first part this run exports. Non-zero when
+     * the user resumes from the middle, so zip filenames keep the part numbers
+     * a full export would have produced (e.g. part 5/12 even though it's the
+     * first batch processed this run).
+     */
+    const partOffsetRef = useRef(0)
+    /** 1-based zip part to start exporting from (resume support) */
+    const [startPart, setStartPart] = useState(1)
     /** Set to true when the user clicks Cancel — prevents the 'done' handler from starting the next batch */
     const cancelledRef = useRef(false)
     /** Incremented on each new fetch; callbacks check this to discard stale results after remount */
@@ -459,8 +468,10 @@ const DialogContent: FC<DialogContentProps> = ({ format }) => {
             setProgress({
                 ...prog,
                 rateLimitWaitSecs: prog.rateLimitWaitSecs,
-                batchIndex: batchIndexRef.current,
-                totalBatches: totalBatchesRef.current,
+                // Display global part numbers (resume keeps prior runs' numbering)
+                batchIndex: partOffsetRef.current + batchIndexRef.current,
+                totalBatches: partOffsetRef.current + totalBatchesRef.current,
+                // Conversation counters only track what this run processes
                 completed: batchIndexRef.current * EXPORT_OPERATION_BATCH + prog.completed,
                 total: totalBatchesRef.current * EXPORT_OPERATION_BATCH,
             })
@@ -495,12 +506,14 @@ const DialogContent: FC<DialogContentProps> = ({ format }) => {
             }
             const batchIdx = batchIndexRef.current
             const totalBatches = totalBatchesRef.current
-            const partIndex = batchIdx + 1
+            // Global numbering so resumed runs continue the previous filenames
+            const partIndex = partOffsetRef.current + batchIdx + 1
+            const totalParts = partOffsetRef.current + totalBatches
             const callback = exportAllOptions.find(o => o.label === exportType)?.callback
             if (callback) {
-                await callback(format, results, metaList, selectedProject?.display.name, partIndex, totalBatches)
+                await callback(format, results, metaList, selectedProject?.display.name, partIndex, totalParts)
             }
-            if (partIndex < totalBatches) {
+            if (batchIdx + 1 < totalBatches) {
                 await sleep(400)
                 batchIndexRef.current++
                 const nextChunk = pendingBatchesRef.current[batchIndexRef.current]
@@ -561,22 +574,26 @@ const DialogContent: FC<DialogContentProps> = ({ format }) => {
     const exportAllFromApi = useCallback(() => {
         if (disabled) return
         cancelledRef.current = false
-        const chunks = chunkArray(selected, EXPORT_OPERATION_BATCH)
+        const allChunks = chunkArray(selected, EXPORT_OPERATION_BATCH)
+        // Resume support: skip the parts a previous run already downloaded
+        const startIdx = Math.min(Math.max(startPart, 1), allChunks.length) - 1
+        const chunks = allChunks.slice(startIdx)
         pendingBatchesRef.current = chunks
         batchIndexRef.current = 0
         totalBatchesRef.current = chunks.length
+        partOffsetRef.current = startIdx
         setProcessing(true)
         setProgress({
-            total: selected.length,
+            total: selected.length - startIdx * EXPORT_OPERATION_BATCH,
             completed: 0,
             currentName: '',
             currentStatus: 'processing',
             rateLimitWaitSecs: undefined,
-            batchIndex: 0,
-            totalBatches: chunks.length,
+            batchIndex: startIdx,
+            totalBatches: allChunks.length,
         })
         startApiBatch(chunks[0])
-    }, [disabled, selected, startApiBatch])
+    }, [disabled, selected, startApiBatch, startPart])
 
     const exportAllFromLocal = useCallback(async () => {
         if (disabled) return
@@ -584,13 +601,14 @@ const DialogContent: FC<DialogContentProps> = ({ format }) => {
         const callback = exportAllOptions.find(o => o.label === exportType)?.callback
         if (!callback) return
         const chunks = chunkArray(results, EXPORT_OPERATION_BATCH)
+        const startIdx = Math.min(Math.max(startPart, 1), chunks.length) - 1
         setProcessing(true)
-        for (let i = 0; i < chunks.length; i++) {
+        for (let i = startIdx; i < chunks.length; i++) {
             await callback(format, chunks[i], metaList, selectedProject?.display.name, i + 1, chunks.length)
             if (i < chunks.length - 1) await sleep(400)
         }
         setProcessing(false)
-    }, [disabled, selected, localConversations, exportAllOptions, exportType, format, metaList, selectedProject])
+    }, [disabled, selected, localConversations, exportAllOptions, exportType, format, metaList, selectedProject, startPart])
 
     const exportAll = useMemo(() => {
         return exportSource === 'API' ? exportAllFromApi : exportAllFromLocal
@@ -721,6 +739,7 @@ const DialogContent: FC<DialogContentProps> = ({ format }) => {
     }, [loadingMore, selectedProjectId])
 
     const totalBatches = Math.ceil(selected.length / EXPORT_OPERATION_BATCH) || 1
+    const effectiveStartPart = Math.min(Math.max(startPart, 1), totalBatches)
 
     // ── API health probe ──────────────────────────────────────────────────────
     type ProbeStatus = null | 'testing' | 'ok' | 'rate_limited' | 'error'
@@ -860,9 +879,35 @@ const DialogContent: FC<DialogContentProps> = ({ format }) => {
                 </button>
             </div>
             {totalBatches > 1 && !processing && (
-                <p className="mt-1.5 text-xs text-right text-gray-400 dark:text-gray-500">
-                    {`${totalBatches} downloads \u00B7 100 conversations each`}
-                </p>
+                <div className="mt-1.5 flex items-center justify-end gap-1.5 text-xs text-gray-400 dark:text-gray-500">
+                    <span>{`${totalBatches} downloads \u00B7 ${EXPORT_OPERATION_BATCH} conversations each \u00B7 start at part`}</span>
+                    <input
+                        type="number"
+                        min="1"
+                        max={totalBatches}
+                        value={effectiveStartPart}
+                        title={`Resume an interrupted export: parts before #${effectiveStartPart} are skipped, filenames keep the same numbering`}
+                        onChange={(e) => {
+                            const n = Math.floor(Number(e.currentTarget.value)) || 1
+                            setStartPart(Math.min(Math.max(n, 1), totalBatches))
+                        }}
+                        style={{
+                            width: '3.5rem',
+                            fontSize: '0.75rem',
+                            padding: '2px 5px',
+                            border: '1px solid #9ca3af',
+                            borderRadius: '3px',
+                            background: 'transparent',
+                            color: 'inherit',
+                        }}
+                    />
+                    <span>{`/ ${totalBatches}`}</span>
+                    {effectiveStartPart > 1 && (
+                        <span className="text-amber-600 dark:text-amber-500">
+                            {`\u2192 exports #${(effectiveStartPart - 1) * EXPORT_OPERATION_BATCH + 1}\u2013${selected.length}`}
+                        </span>
+                    )}
+                </div>
             )}
             {processing && (
                 <>
