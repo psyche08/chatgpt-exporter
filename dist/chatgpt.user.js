@@ -3,7 +3,7 @@
 // @name:zh-CN         ChatGPT Exporter
 // @name:zh-TW         ChatGPT Exporter
 // @namespace          pionxzh
-// @version            2.34.1
+// @version            2.35.0
 // @author             pionxzh
 // @description        Export ChatGPT conversations with one click — backup & share effortlessly!
 // @description:zh-CN  一键导出 ChatGPT 对话，轻松备份与分享
@@ -23033,6 +23033,8 @@ ${content2}`;
     const pendingBatchesRef = _([]);
     const batchIndexRef = _(0);
     const totalBatchesRef = _(0);
+    const partOffsetRef = _(0);
+    const [startPart, setStartPart] = h$4(1);
     const cancelledRef = _(false);
     const fetchGenRef = _(0);
     const onUpload = T$4((e2) => {
@@ -23065,8 +23067,10 @@ ${content2}`;
         setProgress({
           ...prog,
           rateLimitWaitSecs: prog.rateLimitWaitSecs,
-          batchIndex: batchIndexRef.current,
-          totalBatches: totalBatchesRef.current,
+          // Display global part numbers (resume keeps prior runs' numbering)
+          batchIndex: partOffsetRef.current + batchIndexRef.current,
+          totalBatches: partOffsetRef.current + totalBatchesRef.current,
+          // Conversation counters only track what this run processes
           completed: batchIndexRef.current * EXPORT_OPERATION_BATCH + prog.completed,
           total: totalBatchesRef.current * EXPORT_OPERATION_BATCH
         });
@@ -23098,12 +23102,13 @@ ${content2}`;
         }
         const batchIdx = batchIndexRef.current;
         const totalBatches2 = totalBatchesRef.current;
-        const partIndex = batchIdx + 1;
+        const partIndex = partOffsetRef.current + batchIdx + 1;
+        const totalParts = partOffsetRef.current + totalBatches2;
         const callback = (_a = exportAllOptions.find((o3) => o3.label === exportType)) == null ? void 0 : _a.callback;
         if (callback) {
-          await callback(format, results, metaList, selectedProject == null ? void 0 : selectedProject.display.name, partIndex, totalBatches2);
+          await callback(format, results, metaList, selectedProject == null ? void 0 : selectedProject.display.name, partIndex, totalParts);
         }
-        if (partIndex < totalBatches2) {
+        if (batchIdx + 1 < totalBatches2) {
           await sleep(400);
           batchIndexRef.current++;
           const nextChunk = pendingBatchesRef.current[batchIndexRef.current];
@@ -23161,22 +23166,25 @@ Cancel: stop here (already exported parts are kept)`);
     const exportAllFromApi = T$4(() => {
       if (disabled) return;
       cancelledRef.current = false;
-      const chunks = chunkArray(selected, EXPORT_OPERATION_BATCH);
+      const allChunks = chunkArray(selected, EXPORT_OPERATION_BATCH);
+      const startIdx = Math.min(Math.max(startPart, 1), allChunks.length) - 1;
+      const chunks = allChunks.slice(startIdx);
       pendingBatchesRef.current = chunks;
       batchIndexRef.current = 0;
       totalBatchesRef.current = chunks.length;
+      partOffsetRef.current = startIdx;
       setProcessing(true);
       setProgress({
-        total: selected.length,
+        total: selected.length - startIdx * EXPORT_OPERATION_BATCH,
         completed: 0,
         currentName: "",
         currentStatus: "processing",
         rateLimitWaitSecs: void 0,
-        batchIndex: 0,
-        totalBatches: chunks.length
+        batchIndex: startIdx,
+        totalBatches: allChunks.length
       });
       startApiBatch(chunks[0]);
-    }, [disabled, selected, startApiBatch]);
+    }, [disabled, selected, startApiBatch, startPart]);
     const exportAllFromLocal = T$4(async () => {
       var _a;
       if (disabled) return;
@@ -23184,13 +23192,14 @@ Cancel: stop here (already exported parts are kept)`);
       const callback = (_a = exportAllOptions.find((o3) => o3.label === exportType)) == null ? void 0 : _a.callback;
       if (!callback) return;
       const chunks = chunkArray(results, EXPORT_OPERATION_BATCH);
+      const startIdx = Math.min(Math.max(startPart, 1), chunks.length) - 1;
       setProcessing(true);
-      for (let i2 = 0; i2 < chunks.length; i2++) {
+      for (let i2 = startIdx; i2 < chunks.length; i2++) {
         await callback(format, chunks[i2], metaList, selectedProject == null ? void 0 : selectedProject.display.name, i2 + 1, chunks.length);
         if (i2 < chunks.length - 1) await sleep(400);
       }
       setProcessing(false);
-    }, [disabled, selected, localConversations, exportAllOptions, exportType, format, metaList, selectedProject]);
+    }, [disabled, selected, localConversations, exportAllOptions, exportType, format, metaList, selectedProject, startPart]);
     const exportAll = F$1(() => {
       return exportSource === "API" ? exportAllFromApi : exportAllFromLocal;
     }, [exportSource, exportAllFromApi, exportAllFromLocal]);
@@ -23304,6 +23313,7 @@ Cancel: stop loading`)
       }
     }, [loadingMore, selectedProjectId]);
     const totalBatches = Math.ceil(selected.length / EXPORT_OPERATION_BATCH) || 1;
+    const effectiveStartPart = Math.min(Math.max(startPart, 1), totalBatches);
     const [probeStatus, setProbeStatus] = h$4(null);
     const [probeRetryAfterSecs, setProbeRetryAfterSecs] = h$4();
     const [probeHeaders, setProbeHeaders] = h$4({});
@@ -23411,7 +23421,34 @@ Cancel: stop loading`)
         /* @__PURE__ */ o$8("button", { className: "Button red", disabled: disabled || exportSource === "Local", onClick: deleteAll, children: t2("Delete") }),
         /* @__PURE__ */ o$8("button", { className: "Button green", disabled, onClick: exportAll, children: t2("Export") })
       ] }),
-      totalBatches > 1 && !processing && /* @__PURE__ */ o$8("p", { className: "mt-1.5 text-xs text-right text-gray-400 dark:text-gray-500", children: `${totalBatches} downloads · 100 conversations each` }),
+      totalBatches > 1 && !processing && /* @__PURE__ */ o$8("div", { className: "mt-1.5 flex items-center justify-end gap-1.5 text-xs text-gray-400 dark:text-gray-500", children: [
+        /* @__PURE__ */ o$8("span", { children: `${totalBatches} downloads · ${EXPORT_OPERATION_BATCH} conversations each · start at part` }),
+        /* @__PURE__ */ o$8(
+          "input",
+          {
+            type: "number",
+            min: "1",
+            max: totalBatches,
+            value: effectiveStartPart,
+            title: `Resume an interrupted export: parts before #${effectiveStartPart} are skipped, filenames keep the same numbering`,
+            onChange: (e2) => {
+              const n2 = Math.floor(Number(e2.currentTarget.value)) || 1;
+              setStartPart(Math.min(Math.max(n2, 1), totalBatches));
+            },
+            style: {
+              width: "3.5rem",
+              fontSize: "0.75rem",
+              padding: "2px 5px",
+              border: "1px solid #9ca3af",
+              borderRadius: "3px",
+              background: "transparent",
+              color: "inherit"
+            }
+          }
+        ),
+        /* @__PURE__ */ o$8("span", { children: `/ ${totalBatches}` }),
+        effectiveStartPart > 1 && /* @__PURE__ */ o$8("span", { className: "text-amber-600 dark:text-amber-500", children: `→ exports #${(effectiveStartPart - 1) * EXPORT_OPERATION_BATCH + 1}–${selected.length}` })
+      ] }),
       processing && /* @__PURE__ */ o$8(k$3, { children: [
         /* @__PURE__ */ o$8("div", { className: "mt-2 mb-1 justify-between flex items-center gap-2", children: [
           /* @__PURE__ */ o$8("span", { className: "truncate text-sm text-gray-600 dark:text-gray-300", children: progress.currentStatus === "rate_limited" ? `⏳ Rate limited — waiting ${progress.rateLimitWaitSecs ?? "…"}s` : progress.currentName }),
